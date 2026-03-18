@@ -3,44 +3,42 @@
 # rescan-spam.sh
 # ==============
 #   Rescan INBOX eines Dovecot-Maildir-Users mit spamc (SpamAssassin)
+#   - Ermittelt Mail-Base-Pfad automatisch aus dovecot-Konfiguration
 #   - Berechnet neuen Spam-Score
 #   - Loggt Ergebnisse
-#   - Optional: verschiebt Spam in Junk (auskommentiert!)
-#   - Optional: Bayes-Training (sehr vorsichtig!)
+#   - Optional: verschiebt Spam in Junk (auskommentiert / mit --move)
 #
-# Aufruf:   ./rescan-spam.sh -u benutzer@domain.de
-#           ./rescan-spam.sh -u benutzer@domain.de --move --learn-spam-threshold=7.0
-#
-# Voraussetzungen:
-#   - spamc läuft (spamd muss aktiv sein)
-#   - User hat Maildir unter deinem Pfad (aus dovecot.conf: /mnt/eichert2/vmail/%d/%n/Maildir)
-#   - Script als root oder vmail laufen lassen (wegen Rechten)
+# Aufruf-Beispiele:
+#   ./rescan-spam.sh -u benutzer@domain.de
+#   ./rescan-spam.sh -u benutzer@domain.de --move --dry-run
+#   ./rescan-spam.sh -u benutzer@domain.de --learn-spam-threshold=7.0
 
 set -u
 set -e
 
 # ==================== Konfiguration ====================
 
-MAIL_BASE="/mnt/eichert2/vmail"           # aus deiner dovecot.conf
-SPAMC="spamc"                             # oder spamc -d 127.0.0.1 -p 783
+SPAMC="spamc"                             # ggf. spamc -d 127.0.0.1 -p 783
 DEFAULT_THRESHOLD=5.0
 LOGFILE="/var/log/rescan-spam.log"
+JUNK_FOLDER=".Junk"                       # .Junk / .Spam / Spam – anpassen falls nötig
 
 # =========================================================
 
 usage() {
   cat <<EOF
-Usage: $0 -u <user@domain> [Optionen]
+Usage: $0 -u <benutzer@domain.de> [Optionen]
 
 Optionen:
   --move                     Spam-Mails wirklich in Junk verschieben
-  --learn-spam-threshold=N   Ab Score N als Spam lernen (--spam)
-  --learn-ham                Alle Mails als Ham lernen (sehr gefährlich!)
+  --learn-spam-threshold=N   Ab Score >= N als Spam lernen (--spam)
+  --learn-ham                Alle Mails als Ham lernen (sehr vorsichtig!)
   --dry-run                  Nur simulieren, nichts ändern
   --help                     Diese Hilfe
 
-Beispiel:
-  $0 -u benutzer@domain.de --move --learn-spam-threshold=7.0
+Beispiele:
+  $0 -u benutzer@domain.de
+  $0 -u benutzer@domain.de --move --dry-run
 EOF
   exit 1
 }
@@ -66,93 +64,117 @@ done
 
 [[ -z "$USER" ]] && { echo "Fehler: -u <user@domain> fehlt"; usage; }
 
-# User -> Maildir-Pfad umwandeln (dein Format: domain/username)
+# ────────────────────────────────────────────────
+#    Mail-Base-Pfad aus Dovecot-Konfiguration holen
+# ────────────────────────────────────────────────
+
+# Versuchen, mail_home zu bekommen (meist /path/%d/%n oder ähnlich)
+MAIL_HOME_TEMPLATE=$(doveconf -n mail_home 2>/dev/null || true)
+
+if [[ -z "$MAIL_HOME_TEMPLATE" ]]; then
+  # Fallback: mail_location auswerten (oft komplizierter: maildir:/path/%d/%n/Maildir)
+  MAIL_LOCATION=$(doveconf -n mail_location 2>/dev/null || true)
+  if [[ "$MAIL_LOCATION" =~ ^maildir:(.+)/Maildir(:.*)?$ ]]; then
+    MAIL_HOME_TEMPLATE="${BASH_REMATCH[1]}"
+  else
+    echo "Fehler: Weder mail_home noch mail_location mit Maildir konnte ermittelt werden."
+    echo "Bitte setze MAIL_BASE manuell im Skript."
+    exit 3
+  fi
+fi
+
+# Variablen ersetzen: %{domain} → domain, %{username} → localpart, %{user} → user@domain
+# Wir brauchen nur den statischen Teil vor den Variablen
+# Einfache Variante: alles bis zum ersten % abschneiden
+MAIL_BASE="${MAIL_HOME_TEMPLATE%%\%*}"
+
+# Sicherstellen, dass kein abschließender / fehlt
+MAIL_BASE="${MAIL_BASE%/}"
+
+[[ -z "$MAIL_BASE" || ! -d "$MAIL_BASE" ]] && {
+  echo "Fehler: Konnte plausiblen Mail-Base-Pfad nicht ermitteln."
+  echo "Gefunden: '$MAIL_BASE'"
+  echo "Template war: '$MAIL_HOME_TEMPLATE'"
+  exit 4
+}
+
+echo "Automatisch ermittelter Mail-Base-Pfad: $MAIL_BASE" | tee -a "$LOGFILE"
+
+# ────────────────────────────────────────────────
+#    User → Maildir-Pfad
+# ────────────────────────────────────────────────
+
 DOMAIN="${USER##*@}"
 USERNAME="${USER%@*}"
 MAILDIR="$MAIL_BASE/$DOMAIN/$USERNAME/Maildir"
 
-[[ ! -d "$MAILDIR" ]] && { echo "Fehler: Maildir nicht gefunden: $MAILDIR"; exit 2; }
+[[ ! -d "$MAILDIR" ]] && {
+  echo "Fehler: Maildir nicht gefunden: $MAILDIR"
+  exit 2
+}
 
 INBOX_CUR="$MAILDIR/cur"
 INBOX_NEW="$MAILDIR/new"
-JUNK_DIR="$MAILDIR/.Junk"   # oder .Spam / .Junk – passe ggf. an!
-
-[[ ! -d "$INBOX_CUR" ]] && { echo "Warnung: cur/ fehlt"; }
+JUNK_DIR="$MAILDIR/$JUNK_FOLDER"
 
 echo "=== Rescan für $USER ===" | tee -a "$LOGFILE"
 echo "Maildir: $MAILDIR" | tee -a "$LOGFILE"
 echo "Spamc:   $(spamc -V 2>/dev/null || echo 'nicht gefunden')" | tee -a "$LOGFILE"
 echo "" | tee -a "$LOGFILE"
 
-# Funktion zum Verarbeiten einer einzelnen Mail
+# Funktion zum Verarbeiten einer Mail
 process_mail() {
   local file="$1"
   local base=$(basename "$file")
 
-  # Mail durch spamc jagen (nur Check, kein Delivery)
   local output
   output=$(cat "$file" | $SPAMC --check 2>/dev/null)
 
-  # Score extrahieren (Zeile: X-Spam-Status: No, score=2.1 ...)
   local score_line=$(echo "$output" | grep -m1 '^X-Spam-Status:')
-  local score=$(echo "$score_line" | grep -oP 'score=\K-?\d+\.?\d*')
-
-  if [[ -z "$score" ]]; then
-    echo "WARN: Score nicht gefunden für $base" | tee -a "$LOGFILE"
-    return
-  fi
+  local score=$(echo "$score_line" | grep -oP 'score=\K-?\d+\.?\d*' || echo "?.??")
 
   echo "$base → Score = $score" | tee -a "$LOGFILE"
 
-  # Optional: Bayes lernen
-  if [[ -n "$LEARN_SPAM_THRESHOLD" && $(echo "$score >= $LEARN_SPAM_THRESHOLD" | bc -l) -eq 1 ]]; then
+  # Bayes lernen – Spam
+  if [[ -n "$LEARN_SPAM_THRESHOLD" ]] && command -v bc >/dev/null && (( $(echo "$score >= $LEARN_SPAM_THRESHOLD" | bc -l) )); then
     echo "   → LERNE SPAM (>$LEARN_SPAM_THRESHOLD)" | tee -a "$LOGFILE"
     [[ $DRY_RUN -eq 0 ]] && cat "$file" | $SPAMC --spam --learntype=bulk >/dev/null
   fi
 
+  # Bayes lernen – Ham (alle)
   if [[ $LEARN_HAM -eq 1 ]]; then
-    echo "   → LERNE HAM (alle!)" | tee -a "$LOGFILE"
+    echo "   → LERNE HAM (Vorsicht!)" | tee -a "$LOGFILE"
     [[ $DRY_RUN -eq 0 ]] && cat "$file" | $SPAMC --ham --learntype=bulk >/dev/null
   fi
 
-  # Optional: Verschieben in Junk
-  if [[ $DO_MOVE -eq 1 && $(echo "$score >= $DEFAULT_THRESHOLD" | bc -l) -eq 1 ]]; then
-    echo "   → WÜRDE NACH Junk VERSCHIEBEN" | tee -a "$LOGFILE"
+  # Verschieben
+  if [[ $DO_MOVE -eq 1 ]] && command -v bc >/dev/null && (( $(echo "$score >= $DEFAULT_THRESHOLD" | bc -l) )); then
+    echo "   → verschiebe nach $JUNK_FOLDER" | tee -a "$LOGFILE"
     if [[ $DRY_RUN -eq 0 ]]; then
-      # Mail in Junk/cur verschieben (Dovecot-kompatibel)
-      local target="$JUNK_DIR/cur/$base"
-      mkdir -p "$JUNK_DIR/cur" "$JUNK_DIR/tmp" "$JUNK_DIR/new"
-      mv "$file" "$target"
+      mkdir -p "$JUNK_DIR/cur" "$JUNK_DIR/tmp" "$JUNK_DIR/new" 2>/dev/null || true
+      mv -f "$file" "$JUNK_DIR/cur/$base"
     fi
   fi
 }
 
 # =============================================
-# MAIN
+# MAIN – Mails verarbeiten
 # =============================================
 
-# Zähler
 count=0
-moved=0
 
-# new/ zuerst (sehr junge Mails)
-for f in "$INBOX_NEW"/*; do
-  [[ -f "$f" ]] || continue
-  process_mail "$f"
-  ((count++))
-done
-
-# cur/ (gelesene Mails)
-for f in "$INBOX_CUR"/*; do
-  [[ -f "$f" ]] || continue
-  process_mail "$f"
-  ((count++))
+for dir in "$INBOX_NEW" "$INBOX_CUR"; do
+  [[ ! -d "$dir" ]] && continue
+  for f in "$dir"/*; do
+    [[ -f "$f" ]] || continue
+    process_mail "$f"
+    ((count++))
+  done
 done
 
 echo "" | tee -a "$LOGFILE"
 echo "Fertig: $count Mails verarbeitet." | tee -a "$LOGFILE"
-[[ $moved -gt 0 ]] && echo "$moved Mails nach Junk verschoben." | tee -a "$LOGFILE"
 
 if [[ $DRY_RUN -eq 1 ]]; then
-  echo "(Dry-Run – nichts wurde geändert oder gelernt)" | tee -a "$LOGFILE"
+  echo "(Dry-Run – keine Änderungen vorgenommen)" | tee -a "$LOGFILE"
 fi
